@@ -22,6 +22,7 @@ FASTA_ALPHABET = BASES | set("RYSWKMBDHVN-")
 # Public BADGERS uses 28 target bases and 10 context bases on each side.
 CONTEXT_WINDOW = 48
 FIRST_SITE = 11
+JOB_COLUMNS = ("task_id", "cluster", "input_dir", "member_count", "engine", "input_table", "wt_name")
 
 
 @dataclass
@@ -106,7 +107,9 @@ def validate_names(wt, comparisons):
             raise ValueError(f"Filename contains a tab or newline: {sample.path.name!r}.")
         sources[sample.id] = sample.path.name
     for row in comparisons:
-        if row.cluster is not None and row.sample.id == f"{wt.id}_cl{row.cluster}":
+        if row.cluster is not None and row.sample.id in {
+            f"{wt.id}_cl{row.cluster}", f"{wt.id}_cl{row.cluster}_indel"
+        }:
             raise ValueError(f"{row.sample.path.name} conflicts with the generated WT name "
                              f"in cl{row.cluster}.")
 
@@ -196,7 +199,7 @@ def write_fasta(path, records):
                 handle.write(sequence[i:i + 80] + "\n")
 
 
-def write_alignment(path, reference, rows, wt_id):
+def alignment_records(reference, rows, wt_id):
     # Reserve insertion columns at each WT boundary for viewing together.
     widths = defaultdict(int)
     for row in rows:
@@ -211,7 +214,11 @@ def write_alignment(path, reference, rows, wt_id):
 
     records = [(wt_id, aligned(reference, {}))]
     records.extend((row.sample.id, aligned(row.bases, row.insertions)) for row in rows)
-    write_fasta(path, records)
+    return records
+
+
+def write_alignment(path, reference, rows, wt_id):
+    write_fasta(path, alignment_records(reference, rows, wt_id))
 
 
 def summary_row(row):
@@ -234,6 +241,7 @@ def write_bundle(out, wt, comparisons):
         groups[row.cluster].append(row)
     summary = []
     jobs = []
+    indel_jobs = []
     for cluster in sorted(key for key in groups if key is not None):
         rows = groups[cluster]
         label = f"cl{cluster}"
@@ -243,6 +251,23 @@ def write_bundle(out, wt, comparisons):
         directory = out / "clusters" / label
         directory.mkdir(parents=True)
         write_alignment(directory / "aligned.fasta", reference, rows, wt_id)
+        compatible = [row for row in rows if not row.ambiguous_bases]
+        if any(row.kind == "indel" for row in compatible) and len(reference) >= CONTEXT_WINDOW:
+            indel_label = f"{label}_indel"
+            indel_wt_id = f"{wt.id}_{indel_label}"
+            if any(row.sample.id == indel_wt_id for row in compatible):
+                raise ValueError(f"A variant filename conflicts with the generated WT name {indel_wt_id!r}.")
+            indel_directory = out / "clusters" / indel_label
+            indel_directory.mkdir()
+            records = alignment_records(reference, compatible, indel_wt_id)
+            write_fasta(indel_directory / "aligned.fasta", records)
+            table = indel_directory / "input.tsv"
+            kinds = {row.sample.id: row.kind == "indel" for row in compatible}
+            write_tsv(table, ("name", "seq", "cluster", "indel"),
+                      ((name, sequence, indel_label, "yes" if kinds.get(name, False) else "no")
+                       for name, sequence in records))
+            indel_jobs.append((indel_label, indel_directory.relative_to(out).as_posix(),
+                               len(records), "v6_indel", table.relative_to(out).as_posix(), indel_wt_id))
         standard = [row for row in rows if row.kind == "substitution"]
         if not standard or len(reference) < CONTEXT_WINDOW:
             continue
@@ -263,7 +288,11 @@ def write_bundle(out, wt, comparisons):
             raise ValueError(f"{label} has too many members for BADGERS' output filenames. Split this cluster.")
         last_site = FIRST_SITE + len(reference) - CONTEXT_WINDOW
         (directory / "range.tsv").write_text(f"{FIRST_SITE}\t{last_site}\n", encoding="utf-8")
-        jobs.append((len(jobs), label, inputs.relative_to(out).as_posix(), len(stems)))
+        jobs.append((len(jobs), label, inputs.relative_to(out).as_posix(), len(stems),
+                     "ordinary", "", wt_id))
+
+    first_indel_task = len(jobs)
+    jobs.extend((first_indel_task + index, *job) for index, job in enumerate(indel_jobs))
 
     if None in groups:
         summary.append((wt.id, wt.path.name, "unassigned", "reference", "", "", "", "", "", 0, 0, 0))
@@ -271,8 +300,74 @@ def write_bundle(out, wt, comparisons):
         write_alignment(out / "unassigned_aligned.fasta", reference, groups[None], wt.id)
     write_tsv(out / "variant_summary.tsv", columns, summary)
     write_tsv(out / "indels.tsv", columns, (summary_row(row) for row in comparisons if row.kind == "indel"))
-    write_tsv(out / "jobs.tsv", ("task_id", "cluster", "input_dir", "member_count"), jobs)
+    write_tsv(out / "jobs.tsv", JOB_COLUMNS, jobs)
     return len(jobs), len(reference)
+
+
+def add_indel_clusters(staging, output):
+    """Extend an earlier bundle while preserving its ordinary files and task IDs."""
+    if not output.is_dir() or output.is_symlink():
+        raise ValueError("--add-indel-clusters requires an existing prepared directory.")
+    with (staging / "jobs.tsv").open(newline="", encoding="utf-8") as handle:
+        staged_jobs = list(csv.DictReader(handle, delimiter="\t"))
+    staged_by_cluster = {row["cluster"]: row for row in staged_jobs}
+    with (output / "jobs.tsv").open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not set(JOB_COLUMNS[:4]).issubset(reader.fieldnames or []):
+            raise ValueError("Existing jobs.tsv has an unsupported schema.")
+        previous_jobs = list(reader)
+
+    for path in staging.rglob("*"):
+        if not path.is_file() or path.name == "jobs.tsv":
+            continue
+        relative = path.relative_to(staging)
+        destination = output / relative
+        is_indel = len(relative.parts) >= 2 and relative.parts[0] == "clusters" and relative.parts[1].endswith("_indel")
+        if destination.exists() or not is_indel:
+            if not destination.is_file() or destination.read_bytes() != path.read_bytes():
+                raise ValueError(f"Existing prepared file differs from the current inputs: {relative}.")
+        elif (output / "clusters" / relative.parts[1]).exists():
+            raise ValueError(f"Existing indel directory is incomplete or conflicts: {relative.parts[1]}.")
+
+    combined = []
+    task_ids = set()
+    seen_clusters = set()
+    for previous in previous_jobs:
+        cluster = previous["cluster"]
+        staged = staged_by_cluster.get(cluster)
+        if staged is None or cluster in seen_clusters:
+            raise ValueError(f"Existing jobs.tsv conflicts with the current cluster plan: {cluster}.")
+        task_id = int(previous["task_id"])
+        if task_id < 0 or task_id in task_ids:
+            raise ValueError("Existing jobs.tsv has duplicate or negative task IDs.")
+        for column in ("input_dir", "member_count"):
+            if previous[column] != staged[column]:
+                raise ValueError(f"Existing jobs.tsv differs for {cluster}: {column}.")
+        if previous.get("engine", "ordinary") != staged["engine"]:
+            raise ValueError(f"Existing jobs.tsv has a different engine for {cluster}.")
+        if staged["engine"] == "v6_indel":
+            for column in ("input_table", "wt_name"):
+                if previous.get(column) != staged[column]:
+                    raise ValueError(f"Existing jobs.tsv differs for {cluster}: {column}.")
+        combined.append((task_id, *(staged[column] for column in JOB_COLUMNS[1:])))
+        task_ids.add(task_id)
+        seen_clusters.add(cluster)
+    next_id = max(task_ids, default=-1) + 1
+    for staged in staged_jobs:
+        if staged["cluster"] in seen_clusters:
+            continue
+        if staged["engine"] != "v6_indel":
+            raise ValueError(f"Existing bundle is missing ordinary task {staged['cluster']}.")
+        combined.append((next_id, *(staged[column] for column in JOB_COLUMNS[1:])))
+        next_id += 1
+
+    for directory in sorted((staging / "clusters").glob("cl*_indel")):
+        destination = output / "clusters" / directory.name
+        if not destination.exists():
+            directory.rename(destination)
+    write_tsv(staging / "jobs.tsv", JOB_COLUMNS, combined)
+    (staging / "jobs.tsv").replace(output / "jobs.tsv")
+    return len(combined)
 
 
 def prompt_value(label, value, default=None, choices=None, convert=str):
@@ -295,6 +390,8 @@ def main():
     parser.add_argument("--clusters", choices=("check", "filename", "window"),
                         help="check suffixes (default), use _clN suffixes, or group by WT position")
     parser.add_argument("--out", type=Path, help="new directory for the prepared bundle")
+    parser.add_argument("--add-indel-clusters", action="store_true",
+                        help="add indel folders and manifest tasks to an existing --out bundle")
     parser.add_argument("--window", type=positive_int, help="maximum WT span in nt (default: 20)")
     parser.add_argument("--alignment", choices=("global", "prealigned"),
                         help="align each record to WT, or read an existing shared alignment")
@@ -332,8 +429,10 @@ def main():
             return
         if args.out is None:
             parser.error("--out is required with --clusters filename or window")
-        if args.out.exists() or args.out.is_symlink():
+        if (args.out.exists() or args.out.is_symlink()) and not args.add_indel_clusters:
             raise ValueError(f"Output path already exists: {args.out}. Choose a new run directory.")
+        if args.add_indel_clusters and not args.out.is_dir():
+            raise ValueError("--add-indel-clusters requires an existing --out bundle.")
         if args.clusters == "filename" and labeled != len(variant_paths):
             missing = [path.name for path in variant_paths if cluster_suffix(path) is None]
             raise ValueError("Missing _clN suffix: " + ", ".join(missing))
@@ -349,7 +448,10 @@ def main():
             staging = Path(temp) / "bundle"
             staging.mkdir()
             job_count, ref_length = write_bundle(staging, wt, comparisons)
-            staging.rename(args.out)
+            if args.add_indel_clusters:
+                job_count = add_indel_clusters(staging, args.out)
+            else:
+                staging.rename(args.out)
     except (OSError, ValueError, EOFError, argparse.ArgumentTypeError) as error:
         parser.exit(2, f"Error: {error}\n")
 
