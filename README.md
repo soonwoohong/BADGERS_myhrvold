@@ -154,9 +154,25 @@ Tables with sibling workflow metadata must have status `complete`. Legacy BADGER
 
 ## Indel support
 
-Indels are identified and reported during preparation. Their alignment and coordinate information can support a separate scoring workflow. The ordinary BADGERS branch uses the ADAPT activity model and gap-free windows. I could not verify a validated, released LwaCas13a indel/bulge activity predictor that can directly replace ADAPT. [BADGERS importer](https://github.com/broadinstitute/badgers-cas13/blob/main/badgers/utils/import_fasta.py)
+The lab's customized indel search is maintained in the separate `badgers_search_guide` codebase. The inspected local implementation, `search_guide_v6_indel.py`, reports version `6.4.1-deduplicated-contexts-sharded-cpu`. It is the current implemented entry point for junction-focused indel searches. V5 provides more general full-length sliding-window screening. V7 currently provides a numerical objective demonstration.
 
-TIGER is relevant to model development because its RfxCas13d cellular screens included insertions/deletions. Its released training script explicitly loads data with `indels=False`, so these results do not establish an indel-aware model for LwaCas13a diagnostics. CRISPR-Scan provides recent LwaCas13a experimental evidence for indel discrimination. [TIGER paper](https://pubmed.ncbi.nlm.nih.gov/37400521/), [TIGER training code](https://github.com/daklab/tiger/blob/main/tiger_trainer.py), [CRISPR-Scan paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC13669218/)
+V6 identifies indel events from alignment gaps, edit annotations, or pairwise alignment, then selects junction-overlapping guide windows. It builds contiguous 48-nt contexts independently from each allele's full sequence and uses the ADAPT Cas13a classifier and regressor for activity prediction. Finalists are rescored across every full-length off-target register, retaining the highest predicted activity for each comparison sequence. Identical contexts are evaluated once and mapped back to the original sequences. This handles shifted coordinates and unequal allele lengths through contiguous-register scanning. Predicted activities represent those fixed-length contiguous binding contexts.
+
+WT is included as a focal target by default and belongs to each cluster's comparison set. V6 evaluates exact zero-, one-, and two-mismatch guide stages, followed by beam expansion for three to five mismatches. It reports the `k=1`, lambda `0.4` score, on-target minus maximum off-target, and on-target minus mean of the top three off-target activities. Its default on-target cutoff is `-1.4`; use `--cut_off -1.6` for that threshold.
+
+Keep the two codebases as sibling folders under `scripts/`. From the `BADGERS_myhrvold` directory, inspect or plan a custom V6 run with the following commands, using the Python environment configured for the custom workflow.
+
+```bash
+python ../badgers_search_guide/search_guide_v6_indel.py --version
+python ../badgers_search_guide/search_guide_v6_indel.py \
+    -f /path/to/indel_targets.tsv \
+    --output_dir /path/to/output/indel_plan \
+    --cut_off -1.6 --plan_only
+```
+
+V6 accepts XLSX, CSV, and TSV input with a name column (`new_name`, `nick_name`, `name`, or `id`) and a sequence column (`new_seq`, `seq`, or `sequence`). Cluster and explicit `indel` flags can also be supplied. A real search uses the same command with `--plan_only` omitted. The existing `V6_INDEL_PARALLEL_WORKFLOW.md` in the custom checkout describes sharding and validated finalization.
+
+The FASTA preparation stage in this repository exports `indels.tsv` and the review alignments for this separate workflow. `run_badgers.py` and `merge_results.py` implement the upstream BADGERS interface and compiled evolutionary/WGAN tables. V6 uses its own CLI and emits `results_all_targets_v6_indel.tsv` and per-target `results_compiled_v6_indel.tsv`. Its parallel finalizer is `finalize_v6_indel_shards.py`.
 
 ## Verification and attribution
 
